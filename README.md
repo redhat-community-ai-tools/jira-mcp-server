@@ -414,18 +414,48 @@ This installs the server as a Python package, making it available system-wide.
 
 This JIRA MCP server works with **both Claude Desktop (GUI) and Claude Code (CLI)**.
 
-### Environment Variables
+### Configuration Priority
+
+Settings are loaded in the following order:
+1. **Environment variables** (highest priority)
+2. **Persistent config file** `~/.jira-mcp-config.json`
+3. **Default values** (lowest priority)
+
+### Quick Start: Interactive Configuration
+
+Run the configuration wizard to save your settings persistently:
 
 ```bash
-# JIRA Instance Configuration
+python server.py --configure
+```
+
+This creates `~/.jira-mcp-config.json` with secure permissions (0600) containing:
+- **JIRA_URL**: Your JIRA instance URL (required)
+- **JIRA_API_TOKEN**: Your API token (required)
+- **JIRA_ENABLE_WRITE**: Enable write operations - true/false (optional, default: false)
+- **JIRA_EMAIL**: For legacy basic_auth only (optional, not needed for modern JIRA)
+
+**Benefits:**
+- Settings persist between sessions
+- No need to set environment variables every time
+- Secure file permissions (owner-only read/write)
+- View current config: `python server.py --show-config`
+- Reset config: `python config.py reset`
+
+### Environment Variables
+
+You can override the persistent config with environment variables:
+
+```bash
+# Required
 export JIRA_URL="https://jira.your-company.com"
-
-# Default Project (optional but recommended)
-export JIRA_DEFAULT_PROJECT="YOUR_PROJECT_KEY"
-
-# Authentication (if not using jira-cli config)
-export JIRA_EMAIL="your.email@company.com"
 export JIRA_API_TOKEN="your-api-token-here"
+
+# Optional
+export JIRA_ENABLE_WRITE="true"  # Enable write operations (default: false)
+
+# Legacy only (not needed for modern JIRA)
+export JIRA_EMAIL="your.email@company.com"  # Only for old basic_auth
 ```
 
 ### Option 1: Claude Desktop Configuration (GUI)

@@ -1,377 +1,609 @@
-#!/usr/bin/env python3
-"""
-JIRA MCP Server - Generic JIRA operations via Model Context Protocol
-
-Provides JIRA operations (create, edit, link, transition issues) to AI assistants
-via the Model Context Protocol.
-
-Usage:
-    python server.py
-
-Environment Variables:
-    JIRA_URL          - JIRA instance URL (e.g., https://issues.myorg.com)
-    JIRA_API_TOKEN    - JIRA API token or password
-    JIRA_EMAIL        - JIRA user email
-    JIRA_DEFAULT_PROJECT - Default project key (optional)
-"""
+#!/usr/bin/env python
 
 import os
-import sys
-import subprocess
+import argparse
+import types
+from dotenv import load_dotenv
+from jira import JIRA
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
+from fastapi import HTTPException
 import json
-from typing import Optional
-from mcp.server.fastmcp import FastMCP
+import logging
+from config import get_setting
 
-# Initialize FastMCP server
-mcp = FastMCP("jira-mcp-server")
+## Custom fields IDs
+QA_CONTACT_FID = "customfield_12315948"
 
-# Configuration from environment
-JIRA_URL = os.getenv("JIRA_URL", "https://issues.myorg.com")
-JIRA_DEFAULT_PROJECT = os.getenv("JIRA_DEFAULT_PROJECT", "")
+# ─── 1. Load environment variables ─────────────────────────────────────────────
+load_dotenv()
 
-def run_jira_command(args: list[str], check_output: bool = True) -> dict:
+# Settings priority: 1) Environment variables, 2) Config file (~/.jira-mcp-config.json)
+JIRA_URL = get_setting("JIRA_URL")  # Required
+JIRA_API_TOKEN = get_setting("JIRA_API_TOKEN")  # Required
+JIRA_ENABLE_WRITE_OPERATIONS_STRING = get_setting("JIRA_ENABLE_WRITE", "false")  # Optional
+ENABLE_WRITE = JIRA_ENABLE_WRITE_OPERATIONS_STRING.lower() == "true"
+
+# JIRA_EMAIL is optional - only needed for legacy basic_auth (most modern JIRA instances don't need this)
+JIRA_EMAIL = get_setting("JIRA_EMAIL")
+
+# ─── 2. Create a Jira client ───────────────────────────────────────────────────
+#    Uses token_auth (modern) instead of basic_auth
+#    Falls back to basic_auth if JIRA_EMAIL is provided (backward compatibility)
+jira_client = None
+if JIRA_API_TOKEN:
+    if JIRA_EMAIL:
+        # Legacy mode: basic_auth (backward compatibility)
+        jira_client = JIRA(server=JIRA_URL, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
+        logging.warning("Using legacy basic_auth. Consider removing JIRA_EMAIL and using token_auth only.")
+    else:
+        # Modern mode: token_auth (recommended)
+        jira_client = JIRA(server=JIRA_URL, token_auth=JIRA_API_TOKEN)
+
+
+def get_jira_client(headers: dict[str, str] = None):
     """
-    Run jira CLI command and return result.
+    Get a JIRA client instance.
 
-    Args:
-        args: Command arguments to pass to jira CLI
-        check_output: If True, return stdout; if False, return success status
+    If a global jira_client exists (stdio mode), use it.
+    Otherwise, create a new client using the authorization header (server mode).
+    """
+    global jira_client
 
-    Returns:
-        Dictionary with 'success', 'output', and 'error' keys
+    # If we have a global client (stdio mode with env token), use it
+    if jira_client is not None:
+        return jira_client
+
+    # Server mode: extract token from authorization header
+    if headers is None:
+        headers = {}
+
+    auth_header = headers.get("authorization", headers.get("Authorization"))
+    if auth_header:
+        parts = auth_header.split(" ")
+        if len(parts) != 2:
+            raise RuntimeError("Invalid Authorization header format. Expected: 'Bearer <token>'")
+        token = parts[1]
+        return JIRA(server=JIRA_URL, token_auth=token)
+
+    raise RuntimeError("No access token available. Provide Authorization header with Bearer token or set JIRA_API_TOKEN env var.")
+
+# ─── 3. Instantiate the MCP server ─────────────────────────────────────────────
+mcp = FastMCP("Jira Context Server")
+
+
+# ─── 4. Register the get_jira tool ─────────────────────────────────────────────
+@mcp.tool()
+def get_jira(issue_key: str) -> str:
+    """
+    Fetch the Jira issue identified by 'issue_key' using jira_client,
+    then return a Markdown string: "# ISSUE-KEY: summary\n\ndescription"
     """
     try:
-        result = subprocess.run(
-            ["jira"] + args,
-            capture_output=True,
-            text=True,
-            timeout=30
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+    except Exception as e:
+        # If the JIRA client raises an error (e.g. issue not found),
+        # wrap it in an HTTPException so MCP/Client sees a 4xx/5xx.
+        raise HTTPException(status_code=404, detail=f"Failed to fetch Jira issue {issue_key}: {e}")
+
+    # Extract summary & description fields
+    summary = issue.fields.summary or ""
+    description = issue.fields.description or ""
+
+    return f"# {issue_key}: {summary}\n\n{description}"
+
+
+def to_markdown(obj):
+    if isinstance(obj, dict):
+        return "```json\n" + json.dumps(obj, indent=2) + "\n```"
+    elif hasattr(obj, "raw"):
+        return "```json\n" + json.dumps(obj.raw, indent=2) + "\n```"
+    elif isinstance(obj, list):
+        return "\n".join([to_markdown(o) for o in obj])
+    else:
+        return str(obj)
+
+
+@mcp.tool()
+def search_issues(jql: str, max_results: int = 100) -> str:
+    """Search issues using JQL."""
+    try:
+        issues = get_jira_client(get_http_headers()).search_issues(jql, maxResults=max_results)
+        # Extract only essential fields to avoid token limit issues
+        simplified_issues = []
+        for issue in issues:
+            simplified = {
+                "key": issue.key,
+                "summary": issue.fields.summary,
+                "status": issue.fields.status.name if issue.fields.status else None,
+                "assignee": (issue.fields.assignee.displayName if issue.fields.assignee else None),
+                "qa_contact": (
+                    qa_contact.displayName
+                    if (qa_contact := getattr(issue.fields, QA_CONTACT_FID, None))
+                    else None
+                ),
+                "reporter": (issue.fields.reporter.displayName if issue.fields.reporter else None),
+                "priority": (issue.fields.priority.name if issue.fields.priority else None),
+                "issuetype": (issue.fields.issuetype.name if issue.fields.issuetype else None),
+                "fixVersion": (
+                    issue.fields.fixVersions[0].name if issue.fields.fixVersions else None
+                ),
+                "created": issue.fields.created,
+                "updated": issue.fields.updated,
+                "description": issue.fields.description,
+            }
+            simplified_issues.append(simplified)
+        return to_markdown(simplified_issues)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"JQL search failed: {e}")
+
+
+@mcp.tool()
+def search_users(query: str, max_results: int = 10) -> str:
+    """Search users by query."""
+    try:
+        users = get_jira_client(get_http_headers()).search_users(query, maxResults=max_results)
+        return to_markdown([u.raw for u in users])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to search users: {e}")
+
+
+@mcp.tool()
+def list_projects() -> str:
+    """List all projects."""
+    try:
+        projects = get_jira_client(get_http_headers()).projects()
+        return to_markdown([p.raw for p in projects])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch projects: {e}")
+
+
+@mcp.tool()
+def get_project(project_key: str) -> str:
+    """Get a project by key."""
+    try:
+        project = get_jira_client(get_http_headers()).project(project_key)
+        return to_markdown(project)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch project: {e}")
+
+
+@mcp.tool()
+def get_project_components(project_key: str) -> str:
+    """Get components for a project."""
+    try:
+        components = get_jira_client(get_http_headers()).project_components(project_key)
+        return to_markdown([c.raw for c in components])
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch components: {e}")
+
+
+@mcp.tool()
+def get_project_versions(project_key: str) -> str:
+    """Get versions for a project."""
+    try:
+        versions = get_jira_client(get_http_headers()).project_versions(project_key)
+        return to_markdown([v.raw for v in versions])
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch versions: {e}")
+
+
+@mcp.tool()
+def get_project_roles(project_key: str) -> str:
+    """Get roles for a project."""
+    try:
+        roles = get_jira_client(get_http_headers()).project_roles(project_key)
+        return to_markdown(roles)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch roles: {e}")
+
+
+@mcp.tool()
+def get_project_permission_scheme(project_key: str) -> str:
+    """Get permission scheme for a project."""
+    try:
+        scheme = get_jira_client(get_http_headers()).project_permissionscheme(project_key)
+        return to_markdown(scheme.raw)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch permission scheme: {e}")
+
+
+@mcp.tool()
+def get_project_issue_types(project_key: str) -> str:
+    """Get issue types for a project."""
+    try:
+        types = get_jira_client(get_http_headers()).project_issue_types(project_key)
+        return to_markdown([t.raw for t in types])
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch issue types: {e}")
+
+
+@mcp.tool()
+def get_current_user() -> str:
+    """Get current user info."""
+    try:
+        user = get_jira_client(get_http_headers()).myself()
+        return to_markdown(user)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch current user: {e}")
+
+
+@mcp.tool()
+def get_user(account_id: str) -> str:
+    """Get user by account ID."""
+    try:
+        user = get_jira_client(get_http_headers()).user(account_id)
+        return to_markdown(user.raw)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch user: {e}")
+
+
+@mcp.tool()
+def get_assignable_users_for_project(
+    project_key: str, query: str = "", max_results: int = 10
+) -> str:
+    """Get assignable users for a project."""
+    try:
+        users = get_jira_client(get_http_headers()).search_assignable_users_for_projects(
+            query, project_key, maxResults=max_results
+        )
+        return to_markdown([u.raw for u in users])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to get assignable users: {e}")
+
+
+@mcp.tool()
+def get_assignable_users_for_issue(issue_key: str, query: str = "", max_results: int = 10) -> str:
+    """Get assignable users for an issue."""
+    try:
+        users = get_jira_client(get_http_headers()).search_assignable_users_for_issues(
+            query, issueKey=issue_key, maxResults=max_results
+        )
+        return to_markdown([u.raw for u in users])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to get assignable users: {e}")
+
+
+@mcp.tool()
+def list_boards(max_results: int = 10, project_key_or_id: str = None) -> str:
+    """List boards, optionally filtered by project."""
+    try:
+        boards = get_jira_client(get_http_headers()).boards(maxResults=max_results, projectKeyOrID=project_key_or_id)
+        return to_markdown([b.raw for b in boards])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch boards: {e}")
+
+
+@mcp.tool()
+def list_sprints(board_id: int, max_results: int = 10) -> str:
+    """List sprints for a board."""
+    try:
+        sprints = get_jira_client(get_http_headers()).sprints(board_id, maxResults=max_results)
+        return to_markdown([s.raw for s in sprints])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch sprints: {e}")
+
+
+@mcp.tool()
+def get_sprint(sprint_id: int) -> str:
+    """Get sprint by ID."""
+    try:
+        sprint = get_jira_client(get_http_headers()).sprint(sprint_id)
+        return to_markdown(sprint.raw)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Failed to fetch sprint: {e}")
+
+
+@mcp.tool()
+def get_sprints_by_name(board_id: int, state: str = None) -> str:
+    """Get sprints by name for a board, optionally filtered by state."""
+    try:
+        sprints = get_jira_client(get_http_headers()).sprints_by_name(board_id, state=state)
+        return to_markdown(sprints)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch sprints by name: {e}")
+
+
+# ─── 5. Write Operations ───────────────────────────────────────────────────────
+
+
+@mcp.tool(enabled=ENABLE_WRITE)
+def create_issue(
+    project_key: str,
+    summary: str,
+    description: str = "",
+    issue_type: str = "Task",
+    priority: str = "Medium",
+    assignee: str = None,
+) -> str:
+    """Create a new Jira issue."""
+    try:
+        issue_dict = {
+            "project": {"key": project_key},
+            "summary": summary,
+            "description": description,
+            "issuetype": {"name": issue_type},
+            "priority": {"name": priority},
+        }
+
+        if assignee:
+            issue_dict["assignee"] = {"name": assignee}
+
+        new_issue = get_jira_client(get_http_headers()).create_issue(fields=issue_dict)
+        return f"Created issue {new_issue.key}: {summary}"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to create issue: {e}")
+
+
+@mcp.tool(enabled=ENABLE_WRITE)
+def update_issue(
+    issue_key: str,
+    summary: str = None,
+    description: str = None,
+    priority: str = None,
+    assignee: str = None,
+) -> str:
+    """Update an existing Jira issue."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        update_dict = {}
+
+        if summary:
+            update_dict["summary"] = summary
+        if description:
+            update_dict["description"] = description
+        if priority:
+            update_dict["priority"] = {"name": priority}
+        if assignee:
+            update_dict["assignee"] = {"name": assignee}
+
+        if update_dict:
+            issue.update(fields=update_dict)
+            return f"Updated issue {issue_key} successfully"
+        else:
+            return f"No updates provided for issue {issue_key}"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to update issue {issue_key}: {e}")
+
+
+@mcp.tool(enabled=ENABLE_WRITE)
+def add_comment(issue_key: str, comment_body: str) -> str:
+    """Add a comment to a Jira issue."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        comment = get_jira_client(get_http_headers()).add_comment(issue, comment_body)
+        return f"Added comment to {issue_key}: {comment.id}"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to add comment to {issue_key}: {e}")
+
+
+@mcp.tool(enabled=ENABLE_WRITE)
+def delete_comment(issue_key: str, comment_id: str) -> str:
+    """Delete a comment from a Jira issue."""
+    try:
+        comment = get_jira_client(get_http_headers()).comment(issue_key, comment_id)
+        comment.delete()
+        return f"Deleted comment {comment_id} from {issue_key}"
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to delete comment {comment_id} from {issue_key}: {e}",
         )
 
-        return {
-            "success": result.returncode == 0,
-            "output": result.stdout.strip(),
-            "error": result.stderr.strip() if result.returncode != 0 else None
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "output": None,
-            "error": "Command timed out after 30 seconds"
-        }
-    except FileNotFoundError:
-        return {
-            "success": False,
-            "output": None,
-            "error": "jira CLI not found. Install with: brew install ankitpokhrel/jira-cli/jira-cli"
-        }
+
+@mcp.tool()
+def get_issue_comments(issue_key: str) -> str:
+    """Get all comments for a Jira issue."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        comments = []
+        for comment in issue.fields.comment.comments:
+            comment_data = {
+                "id": comment.id,
+                "author": comment.author.displayName if comment.author else "Unknown",
+                "body": comment.body,
+                "created": comment.created,
+                "updated": (comment.updated if hasattr(comment, "updated") else comment.created),
+            }
+            comments.append(comment_data)
+        return to_markdown(comments)
     except Exception as e:
-        return {
-            "success": False,
-            "output": None,
-            "error": f"Unexpected error: {str(e)}"
-        }
+        raise HTTPException(status_code=400, detail=f"Failed to get comments for {issue_key}: {e}")
+
+
+@mcp.tool(enabled=ENABLE_WRITE)
+def assign_issue(issue_key: str, assignee: str) -> str:
+    """Assign a Jira issue to a user."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        get_jira_client(get_http_headers()).assign_issue(issue, assignee)
+        return f"Assigned issue {issue_key} to {assignee}"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to assign issue {issue_key}: {e}")
+
+
+@mcp.tool(enabled=ENABLE_WRITE)
+def unassign_issue(issue_key: str) -> str:
+    """Unassign a Jira issue."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        get_jira_client(get_http_headers()).assign_issue(issue, None)
+        return f"Unassigned issue {issue_key}"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to unassign issue {issue_key}: {e}")
+
+
+@mcp.tool(enabled=ENABLE_WRITE)
+def transition_issue(issue_key: str, transition_name: str, comment: str = None) -> str:
+    """Transition a Jira issue to a new status."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        transitions = get_jira_client(get_http_headers()).transitions(issue)
+
+        # Find the transition by name
+        transition_id = None
+        for trans in transitions:
+            if trans["name"].lower() == transition_name.lower():
+                transition_id = trans["id"]
+                break
+
+        if not transition_id:
+            available_transitions = [t["name"] for t in transitions]
+            return f"Transition '{transition_name}' not found. Available transitions: {', '.join(available_transitions)}"
+
+        # Perform the transition
+        if comment:
+            get_jira_client(get_http_headers()).transition_issue(issue, transition_id, comment=comment)
+            return f"Transitioned issue {issue_key} to '{transition_name}' with comment"
+        else:
+            get_jira_client(get_http_headers()).transition_issue(issue, transition_id)
+            return f"Transitioned issue {issue_key} to '{transition_name}'"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to transition issue {issue_key}: {e}")
+
 
 @mcp.tool()
-def create_issue(
-    summary: str,
-    issue_type: str,
-    project: Optional[str] = None,
-    description: Optional[str] = None,
-    labels: Optional[str] = None
-) -> str:
-    """
-    Create a new JIRA issue (Story, Task, Bug, etc.).
+def get_issue_transitions(issue_key: str) -> str:
+    """Get available transitions for a Jira issue."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        transitions = get_jira_client(get_http_headers()).transitions(issue)
+        transition_list = [{"id": t["id"], "name": t["name"]} for t in transitions]
+        return to_markdown(transition_list)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to get transitions for {issue_key}: {e}"
+        )
 
-    Args:
-        summary: Issue title/summary
-        issue_type: Type of issue (Story, Task, Bug, Epic, Sub-task)
-        project: Project key (e.g., MYTEAM, OCPQE). Uses JIRA_DEFAULT_PROJECT if not specified
-        description: Issue description (optional)
-        labels: Comma-separated labels (e.g., "windows,winc,runtimeclass")
 
-    Returns:
-        JSON string with issue key and URL
+@mcp.tool(enabled=ENABLE_WRITE)
+def delete_issue(issue_key: str) -> str:
+    """Delete a Jira issue (use with caution)."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        issue.delete()
+        return f"Deleted issue {issue_key}"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to delete issue {issue_key}: {e}")
 
-    Example:
-        create_issue("Add RuntimeClass support", "Story", "MYTEAM", "Implement RuntimeClass...", "windows,winc")
-    """
-    proj = project or JIRA_DEFAULT_PROJECT
-    if not proj:
-        return json.dumps({"error": "Project required. Set JIRA_DEFAULT_PROJECT or pass project parameter"})
 
-    # Create issue
-    args = [
-        "issue", "create",
-        "-p", proj,
-        "-t", issue_type,
-        "-s", summary,
-        "--no-input"
-    ]
+@mcp.tool(enabled=ENABLE_WRITE)
+def add_issue_labels(issue_key: str, labels: list) -> str:
+    """Add labels to a Jira issue."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        current_labels = list(issue.fields.labels)
+        new_labels = list(set(current_labels + labels))  # Remove duplicates
+        issue.update(fields={"labels": new_labels})
+        return f"Added labels {labels} to issue {issue_key}"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to add labels to {issue_key}: {e}")
 
-    result = run_jira_command(args)
 
-    if not result["success"]:
-        return json.dumps({"error": result["error"], "output": result["output"]})
+@mcp.tool(enabled=ENABLE_WRITE)
+def remove_issue_labels(issue_key: str, labels: list) -> str:
+    """Remove labels from a Jira issue."""
+    try:
+        issue = get_jira_client(get_http_headers()).issue(issue_key)
+        current_labels = list(issue.fields.labels)
+        new_labels = [label for label in current_labels if label not in labels]
+        issue.update(fields={"labels": new_labels})
+        return f"Removed labels {labels} from issue {issue_key}"
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to remove labels from {issue_key}: {e}"
+        )
 
-    # Extract issue key from output
-    import re
-    match = re.search(r'([A-Z]+-\d+)', result["output"])
-    if not match:
-        return json.dumps({"error": "Could not extract issue key from output", "output": result["output"]})
 
-    issue_key = match.group(1)
+# ─── 6. Utility functions ─────────────────────────────────────────────────────
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Jira Context Server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 
-    # Add description if provided
-    if description:
-        desc_result = run_jira_command([
-            "issue", "edit", issue_key,
-            "-b", description,
-            "--no-input"
-        ])
-        if not desc_result["success"]:
-            return json.dumps({
-                "issue_key": issue_key,
-                "url": f"{JIRA_URL}/browse/{issue_key}",
-                "warning": f"Issue created but description failed: {desc_result['error']}"
-            })
+Configuration:
+  Settings are loaded from (in order):
+  1. Environment variables
+  2. Config file (~/.jira-mcp-config.json)
 
-    # Add labels if provided
-    if labels:
-        for label in labels.split(","):
-            label = label.strip()
-            run_jira_command([
-                "issue", "edit", issue_key,
-                "-l", label,
-                "--no-input"
-            ])
+  python server.py --configure                     # Interactive configuration wizard
+  python server.py --show-config                   # Show current configuration
 
-    return json.dumps({
-        "issue_key": issue_key,
-        "url": f"{JIRA_URL}/browse/{issue_key}",
-        "success": True
-    })
+Environment Variables:
+  JIRA_URL:          Your Jira instance URL
+  JIRA_API_TOKEN:    Your Jira API token
+  JIRA_EMAIL:        (Optional) Email for legacy basic_auth
+  JIRA_ENABLE_WRITE: Enable write operations (true/false)
 
-@mcp.tool()
-def add_labels(issue_key: str, labels: str) -> str:
-    """
-    Add labels to an existing JIRA issue.
+Examples:
+  python server.py                                 # Run with stdio
+  python server.py --transport http                # Streamable HTTP server mode
+  python server.py --transport sse                 # SSE HTTP server mode (deprecated)
+  python server.py --transport sse --port 8080     # Custom port
+  python server.py --transport sse --host 0.0.0.0  # Bind to all interfaces
 
-    Args:
-        issue_key: Issue key (e.g., MYTEAM-1234)
-        labels: Comma-separated labels (e.g., "windows,winc,runtimeclass")
+  # With API token
+  JIRA_API_TOKEN=your_api_key_here python server.py
+        """,
+    )
 
-    Returns:
-        JSON string with success status
+    parser.add_argument(
+        "--configure",
+        action="store_true",
+        help="Run interactive configuration wizard",
+    )
 
-    Example:
-        add_labels("MYTEAM-1234", "windows,winc,test")
-    """
-    results = []
-    for label in labels.split(","):
-        label = label.strip()
-        result = run_jira_command([
-            "issue", "edit", issue_key,
-            "-l", label,
-            "--no-input"
-        ])
-        results.append({
-            "label": label,
-            "success": result["success"],
-            "error": result["error"] if not result["success"] else None
-        })
+    parser.add_argument(
+        "--show-config",
+        action="store_true",
+        help="Display current configuration",
+    )
 
-    return json.dumps({
-        "issue_key": issue_key,
-        "results": results,
-        "url": f"{JIRA_URL}/browse/{issue_key}"
-    })
+    parser.add_argument(
+        "--transport",
+        "-t",
+        choices=["stdio", "http", "sse"],
+        default="stdio",
+        help="Transport mode: stdio (default) or http (streamable HTTP-based server) or sse (deprecated HTTP-based server)",
+    )
 
-@mcp.tool()
-def link_issues(
-    inward_issue: str,
-    outward_issue: str,
-    link_type: str
-) -> str:
-    """
-    Link two JIRA issues together.
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host to bind to in HTTP mode (default: localhost)",
+    )
 
-    Args:
-        inward_issue: First issue key (e.g., MYTEAM-1234)
-        outward_issue: Second issue key (e.g., MYTEAM-1235)
-        link_type: Link type (blocks, Related, Duplicate, Depend)
+    parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=3000,
+        help="Port to bind to in HTTP mode (default: 3000)",
+    )
 
-    Returns:
-        JSON string with success status
+    return parser.parse_args()
 
-    Example:
-        link_issues("MYTEAM-1234", "MYTEAM-1235", "blocks")  # 1235 blocks 1234
-    """
-    result = run_jira_command([
-        "issue", "link",
-        inward_issue,
-        outward_issue,
-        link_type
-    ])
 
-    return json.dumps({
-        "inward_issue": inward_issue,
-        "outward_issue": outward_issue,
-        "link_type": link_type,
-        "success": result["success"],
-        "error": result["error"] if not result["success"] else None
-    })
-
-@mcp.tool()
-def transition_issue(
-    issue_key: str,
-    state: str,
-    resolution: Optional[str] = None,
-    comment: Optional[str] = None
-) -> str:
-    """
-    Transition a JIRA issue to a new state.
-
-    Args:
-        issue_key: Issue key (e.g., MYTEAM-1234)
-        state: Target state (e.g., "In Progress", "Done", "Closed")
-        resolution: Resolution type (e.g., "Done", "Won't Fix", "Duplicate")
-        comment: Optional comment to add during transition
-
-    Returns:
-        JSON string with success status
-
-    Example:
-        transition_issue("MYTEAM-1234", "Closed", "Duplicate")
-    """
-    args = ["issue", "move", issue_key, state, "--no-input"]
-
-    if resolution:
-        args.extend(["-R", resolution])
-
-    if comment:
-        args.extend(["--comment", comment])
-
-    result = run_jira_command(args)
-
-    return json.dumps({
-        "issue_key": issue_key,
-        "state": state,
-        "resolution": resolution,
-        "success": result["success"],
-        "error": result["error"] if not result["success"] else None,
-        "url": f"{JIRA_URL}/browse/{issue_key}"
-    })
-
-@mcp.tool()
-def search_issues(
-    jql: str,
-    max_results: int = 50
-) -> str:
-    """
-    Search for JIRA issues using JQL (JIRA Query Language).
-
-    Args:
-        jql: JQL query string (e.g., "project = MYTEAM AND status = Open")
-        max_results: Maximum number of results to return (default: 50)
-
-    Returns:
-        JSON string with list of matching issues
-
-    Example:
-        search_issues("project = MYTEAM AND labels = windows", 10)
-    """
-    result = run_jira_command([
-        "issue", "list",
-        "--jql", jql,
-        "--plain",
-        "--columns", "KEY,SUMMARY,STATUS,ASSIGNEE",
-        "--no-headers"
-    ])
-
-    if not result["success"]:
-        return json.dumps({"error": result["error"]})
-
-    issues = []
-    for line in result["output"].split("\n")[:max_results]:
-        if line.strip():
-            parts = line.split("\t")
-            if len(parts) >= 3:
-                issues.append({
-                    "key": parts[0].strip(),
-                    "summary": parts[1].strip() if len(parts) > 1 else "",
-                    "status": parts[2].strip() if len(parts) > 2 else "",
-                    "assignee": parts[3].strip() if len(parts) > 3 else "",
-                    "url": f"{JIRA_URL}/browse/{parts[0].strip()}"
-                })
-
-    return json.dumps({
-        "jql": jql,
-        "count": len(issues),
-        "issues": issues
-    })
-
-@mcp.tool()
-def view_issue(issue_key: str) -> str:
-    """
-    Get detailed information about a JIRA issue.
-
-    Args:
-        issue_key: Issue key (e.g., MYTEAM-1234)
-
-    Returns:
-        JSON string with issue details
-
-    Example:
-        view_issue("MYTEAM-1234")
-    """
-    result = run_jira_command([
-        "issue", "view", issue_key,
-        "--plain"
-    ])
-
-    if not result["success"]:
-        return json.dumps({"error": result["error"]})
-
-    return json.dumps({
-        "issue_key": issue_key,
-        "details": result["output"],
-        "url": f"{JIRA_URL}/browse/{issue_key}",
-        "success": True
-    })
-
-@mcp.tool()
-def batch_close_issues(
-    issue_keys: str,
-    resolution: str = "Duplicate",
-    comment: Optional[str] = None
-) -> str:
-    """
-    Close multiple JIRA issues at once.
-
-    Args:
-        issue_keys: Comma-separated issue keys (e.g., "MYTEAM-1234,MYTEAM-1235,MYTEAM-1236")
-        resolution: Resolution type (default: "Duplicate")
-        comment: Optional comment to add to all issues
-
-    Returns:
-        JSON string with results for each issue
-
-    Example:
-        batch_close_issues("OCPQE-31602,OCPQE-31603", "Duplicate", "Closing as duplicate QE trackers")
-    """
-    results = []
-    keys = [k.strip() for k in issue_keys.split(",")]
-
-    for key in keys:
-        result = transition_issue(key, "Closed", resolution, comment)
-        results.append(json.loads(result))
-
-    return json.dumps({
-        "total": len(keys),
-        "results": results
-    })
+# ─── 7. Run the MCP server  ───────────────────────────────
 
 if __name__ == "__main__":
-    # Run the MCP server
-    mcp.run()
+    args = parse_arguments()
+
+    # Handle configuration commands
+    if args.configure:
+        from config import configure_interactive
+        configure_interactive()
+        exit(0)
+
+    if args.show_config:
+        from config import show_config
+        show_config()
+        exit(0)
+
+    # Run the server
+    if args.transport == "stdio":
+        mcp.run(transport=args.transport)
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
