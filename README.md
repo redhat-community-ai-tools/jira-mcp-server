@@ -414,6 +414,18 @@ This installs the server as a Python package, making it available system-wide.
 
 This JIRA MCP server works with **both Claude Desktop (GUI) and Claude Code (CLI)**.
 
+### Quick Reference: Claude Desktop vs Claude Code
+
+| Aspect | Claude Desktop | Claude Code |
+|--------|---------------|-------------|
+| **Config file** | `~/Library/Application Support/Claude/claude_desktop_config.json` | `~/.claude.json` |
+| **Config scope** | Global (all conversations) | Per-project (each directory) |
+| **MCP location** | `mcpServers` at root level | `projects.<path>.mcpServers` |
+| **Server name** | Usually `jira` | Can be `jira` or `jira-prod` |
+| **Restart required** | Yes (restart app) | Yes (exit/restart in directory) |
+
+**Key difference:** Claude Desktop has **global** MCP configuration, while Claude Code has **per-project** configuration. This means you must configure jira-prod separately for each working directory in Claude Code.
+
 ### Configuration Priority
 
 Settings are loaded in the following order:
@@ -491,53 +503,120 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ### Option 2: Claude Code Configuration (CLI)
 
-Add to `~/.claude/config.json`:
+**IMPORTANT:** Claude Code uses **per-project MCP configuration**, not global configuration.
+
+#### Understanding Claude Code's Configuration Model
+
+Unlike Claude Desktop, Claude Code does **not** support global MCP server configuration. MCP servers are configured per-project in `~/.claude.json` under each project's directory path.
+
+**Key differences:**
+- **Claude Desktop**: Uses `~/Library/Application Support/Claude/claude_desktop_config.json` (global)
+- **Claude Code**: Uses `~/.claude.json` with per-project `mcpServers` sections (no global option)
+
+This means:
+- MCP servers must be configured separately for each working directory
+- Sessions in different directories won't share MCP server configuration
+- You'll need to duplicate MCP server config across projects where you want it available
+
+#### Per-Project Configuration in `~/.claude.json`
+
+Claude Code stores project-specific settings in `~/.claude.json`. Each project directory has its own `mcpServers` section:
 
 ```json
 {
-  "mcpServers": {
-    "jira": {
-      "command": "python",
-      "args": ["/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/server.py"],
-      "env": {
-        "JIRA_URL": "https://issues.myorg.com",
-        "JIRA_DEFAULT_PROJECT": "MYTEAM"
+  "projects": {
+    "/Users/YOUR_USERNAME/Documents": {
+      "mcpServers": {
+        "jira-prod": {
+          "type": "stdio",
+          "command": "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/venv/bin/python",
+          "args": [
+            "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/server.py"
+          ],
+          "env": {}
+        }
+      }
+    },
+    "/Users/YOUR_USERNAME/Documents/GitHub/my-project": {
+      "mcpServers": {
+        "jira-prod": {
+          "type": "stdio",
+          "command": "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/venv/bin/python",
+          "args": [
+            "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/server.py"
+          ],
+          "env": {}
+        }
       }
     }
   }
 }
 ```
 
-**Or use absolute path with full environment:**
+**To add jira-prod to a project:**
+
+1. Find your project's section in `~/.claude.json`
+2. Locate the `mcpServers` object (will be empty `{}` if not configured)
+3. Add the jira-prod configuration:
+
+```json
+"mcpServers": {
+  "jira-prod": {
+    "type": "stdio",
+    "command": "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/venv/bin/python",
+    "args": [
+      "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/server.py"
+    ],
+    "env": {}
+  }
+}
+```
+
+4. Exit and restart Claude Code in that directory
+
+**To add jira-prod to multiple projects:**
+
+You'll need to duplicate the `jira-prod` configuration in each project's `mcpServers` section. For example:
 
 ```json
 {
-  "mcpServers": {
-    "jira": {
-      "command": "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/venv/bin/python",
-      "args": ["/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/server.py"],
-      "env": {
-        "JIRA_URL": "https://issues.myorg.com",
-        "JIRA_DEFAULT_PROJECT": "MYTEAM"
+  "projects": {
+    "/Users/YOUR_USERNAME/Documents": {
+      "mcpServers": {
+        "jira-prod": { ... }
+      }
+    },
+    "/Users/YOUR_USERNAME/Documents/GitHub/project-a": {
+      "mcpServers": {
+        "jira-prod": { ... }
+      }
+    },
+    "/Users/YOUR_USERNAME/Documents/GitHub/project-b": {
+      "mcpServers": {
+        "jira-prod": { ... }
       }
     }
   }
 }
 ```
 
-**After configuration:**
-1. Restart your terminal
-2. Run `claude` to start Claude Code
-3. Ask Claude: "Create a test story in YOUR_PROJECT called 'MCP Integration Test'"
-
-**Configuration File Location:**
-- `~/.claude/config.json` (all platforms)
+**Why per-project configuration?**
+- Different projects may need different MCP servers
+- Isolates tool availability by working directory
+- Prevents MCP servers from loading in irrelevant contexts
 
 **Verify MCP Server is Loaded:**
 ```bash
-# When you start Claude Code, you should see:
-# "MCP server jira initialized"
+# When you start Claude Code in a configured directory, you should see:
+# "MCP server jira-prod initialized"
+
+# In an unconfigured directory, jira-prod won't be available
 ```
+
+**After configuration:**
+1. Exit Claude Code if running
+2. Restart Claude Code in the configured directory
+3. Ask Claude: "Create a test story in YOUR_PROJECT called 'MCP Integration Test'"
 
 ### Option 3: Cursor Configuration
 
@@ -1048,6 +1127,81 @@ pip install --upgrade mcp
 5. Check Claude Desktop logs:
    - macOS: `~/Library/Logs/Claude/`
    - Linux: `~/.config/Claude/logs/`
+
+---
+
+#### "jira-prod not available in some Claude Code sessions"
+
+**Problem:** MCP server works in one directory but not others
+
+**Cause:** Claude Code uses **per-project MCP configuration**, not global configuration. The server is only available in directories where you've configured it.
+
+**Solution:**
+
+1. **Check which directory you're in:**
+   ```bash
+   pwd
+   # Example: /Users/yourname/Documents/GitHub/release
+   ```
+
+2. **Edit `~/.claude.json` and find your project's section:**
+   ```bash
+   # Open the config file
+   code ~/.claude.json  # or your editor of choice
+   
+   # Find the section for your current directory
+   # Look for: "/Users/yourname/Documents/GitHub/release": {
+   ```
+
+3. **Add jira-prod to that project's `mcpServers`:**
+   ```json
+   "/Users/yourname/Documents/GitHub/release": {
+     "mcpServers": {
+       "jira-prod": {
+         "type": "stdio",
+         "command": "/Users/yourname/Documents/GitHub/jira-mcp-server/venv/bin/python",
+         "args": [
+           "/Users/yourname/Documents/GitHub/jira-mcp-server/server.py"
+         ],
+         "env": {}
+       }
+     }
+   }
+   ```
+
+4. **Exit and restart Claude Code in that directory**
+
+**To make jira-prod available everywhere:**
+
+Unfortunately, there's no global MCP configuration for Claude Code. You must add the `jira-prod` configuration to each project's `mcpServers` section in `~/.claude.json`.
+
+**Common directories to configure:**
+- Your home directory: `/Users/yourname/Documents`
+- Each Git repository you work in
+- Any worktree directories
+
+**Example multi-project configuration:**
+```json
+{
+  "projects": {
+    "/Users/yourname/Documents": {
+      "mcpServers": {
+        "jira-prod": { ... }
+      }
+    },
+    "/Users/yourname/Documents/GitHub/repo-a": {
+      "mcpServers": {
+        "jira-prod": { ... }
+      }
+    },
+    "/Users/yourname/Documents/GitHub/repo-b": {
+      "mcpServers": {
+        "jira-prod": { ... }
+      }
+    }
+  }
+}
+```
 
 ---
 
