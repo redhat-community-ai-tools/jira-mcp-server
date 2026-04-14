@@ -620,35 +620,226 @@ You'll need to duplicate the `jira-prod` configuration in each project's `mcpSer
 
 ### Option 3: Cursor Configuration
 
-Cursor supports MCP servers through configuration files. See the detailed [Cursor Integration Guide](CURSOR_INTEGRATION.md) for complete setup instructions.
+Cursor is a popular AI-powered code editor that supports MCP servers. This section provides complete setup instructions.
 
-**Quick Setup:**
+#### Prerequisites for Cursor
 
-Create `~/.cursor/mcp.json`:
+1. **Get a Jira API Token:**
+   - Visit https://id.atlassian.com/manage-profile/security/api-tokens
+   - Click "Create API token"
+   - Give it a descriptive name (e.g., "Cursor MCP Server")
+   - Copy and securely save the token
+
+2. **Know your paths:**
+   ```bash
+   # Find absolute path to jira-mcp-server
+   cd ~/Documents/GitHub/jira-mcp-server
+   pwd
+   # Copy this path - you'll need it for configuration
+   ```
+
+#### Configuration Steps
+
+**Create or edit `~/.cursor/mcp.json`** (global configuration):
 
 ```json
 {
   "mcpServers": {
-    "jira": {
-      "command": "/Users/YOUR_USERNAME/jira-mcp-server/venv/bin/python",
-      "args": [
-        "/Users/YOUR_USERNAME/jira-mcp-server/server.py"
-      ],
+    "jira-prod": {
+      "command": "/absolute/path/to/jira-mcp-server/venv/bin/python",
+      "args": ["/absolute/path/to/jira-mcp-server/server.py"],
       "env": {
-        "JIRA_URL": "https://issues.myorg.com",
-        "JIRA_DEFAULT_PROJECT": "MYTEAM"
+        "JIRA_URL": "https://your-instance.atlassian.net",
+        "JIRA_DEFAULT_PROJECT": "MYPROJECT",
+        "JIRA_EMAIL": "your-email@company.com",
+        "JIRA_API_TOKEN": "your-api-token-here"
       }
     }
   }
 }
 ```
 
-**After configuration:**
-1. Restart Cursor
-2. Open Cursor Settings and navigate to MCP Servers
-3. Verify "jira" server appears with available tools
+**Example with specific paths:**
 
-For detailed troubleshooting and configuration options, see [CURSOR_INTEGRATION.md](CURSOR_INTEGRATION.md).
+```json
+{
+  "mcpServers": {
+    "jira-prod": {
+      "command": "/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/venv/bin/python",
+      "args": ["/Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/server.py"],
+      "env": {
+        "JIRA_URL": "https://your-company.atlassian.net",
+        "JIRA_DEFAULT_PROJECT": "MYPROJECT",
+        "JIRA_EMAIL": "your-email@company.com",
+        "JIRA_API_TOKEN": "your-api-token-here"
+      }
+    }
+  }
+}
+```
+
+**Important Configuration Notes:**
+- Use **absolute paths** (e.g., `/Users/username/...` not `~/...`)
+- Replace `YOUR_USERNAME` with your actual username
+- Replace `YOUR-PROJECT-KEY` with your default Jira project
+- Replace `your-email@company.com` with your Jira account email
+- Replace `your-api-token-here` with the API token from step 1
+- The `JIRA_EMAIL` and `JIRA_API_TOKEN` fields are **required** for Cursor
+
+**Alternative: Workspace-specific configuration**
+
+Create `.cursor/mcp.json` in your project directory for project-specific settings:
+
+```json
+{
+  "mcpServers": {
+    "jira-prod": {
+      "command": "/absolute/path/to/jira-mcp-server/venv/bin/python",
+      "args": ["/absolute/path/to/jira-mcp-server/server.py"],
+      "env": {
+        "JIRA_URL": "https://your-company.atlassian.net",
+        "JIRA_DEFAULT_PROJECT": "MYPROJECT",
+        "JIRA_EMAIL": "your-email@company.com",
+        "JIRA_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+#### After Configuration
+
+1. **Restart Cursor completely** (not just reload window)
+2. **Verify the MCP server is connected:**
+   - Look for a green indicator or "MCP" status in Cursor
+   - The server should show as "jira-prod" (connected)
+3. **Test the integration:**
+   - Ask Cursor: "Show me all open issues in [YOUR-PROJECT]"
+   - Ask Cursor: "Create a test task in [YOUR-PROJECT] called 'MCP Integration Test'"
+
+#### Troubleshooting Cursor Setup
+
+**Issue: MCP Server Shows as Red/Disconnected**
+
+**Symptoms:**
+- Red circle next to "jira-prod" in Cursor
+- Error: `401 Unauthorized` or authentication failures
+- Server appears as disconnected
+
+**Solutions:**
+
+1. **Verify credentials are set in `env` section:**
+   ```json
+   "env": {
+     "JIRA_URL": "https://your-instance.atlassian.net",
+     "JIRA_DEFAULT_PROJECT": "PROJECT",
+     "JIRA_EMAIL": "your-email@company.com",      // Required!
+     "JIRA_API_TOKEN": "your-token-here"          // Required!
+   }
+   ```
+
+2. **Test credentials manually:**
+   ```bash
+   curl -u "your-email@company.com:your-api-token" \
+     "https://your-instance.atlassian.net/rest/api/3/myself"
+   ```
+   Should return your user info, not a 401 error.
+
+3. **Verify absolute paths:**
+   ```json
+   // CORRECT
+   "command": "/Users/username/Documents/GitHub/jira-mcp-server/venv/bin/python"
+   
+   // WRONG - do not use these
+   "command": "~/Documents/GitHub/jira-mcp-server/venv/bin/python"
+   "command": "./venv/bin/python"
+   "command": "python"
+   ```
+
+4. **Check virtual environment exists:**
+   ```bash
+   ls -la /Users/YOUR_USERNAME/Documents/GitHub/jira-mcp-server/venv/bin/python
+   # Should show the Python interpreter, not "No such file"
+   ```
+
+5. **Regenerate API token if expired:**
+   - Visit https://id.atlassian.com/manage-profile/security/api-tokens
+   - Delete old token
+   - Create new token
+   - Update `~/.cursor/mcp.json` with new token
+   - Restart Cursor
+
+**Issue: "Python jira library basic_auth mode failing with 401"**
+
+This is a known issue with the Python `jira` library's handling of redirects. The library may strip authentication headers on redirects, while curl preserves them.
+
+**Solution:**
+Ensure both `JIRA_EMAIL` and `JIRA_API_TOKEN` are set in the `env` section. This allows the server to use proper authentication headers.
+
+**Issue: Configuration file not found**
+
+If Cursor can't find `~/.cursor/mcp.json`:
+
+```bash
+# Create the directory if it doesn't exist
+mkdir -p ~/.cursor
+
+# Create the configuration file
+cat > ~/.cursor/mcp.json << 'EOF'
+{
+  "mcpServers": {
+    "jira-prod": {
+      "command": "/absolute/path/to/venv/bin/python",
+      "args": ["/absolute/path/to/server.py"],
+      "env": {
+        "JIRA_URL": "https://your-instance.atlassian.net",
+        "JIRA_DEFAULT_PROJECT": "PROJECT",
+        "JIRA_EMAIL": "your-email@company.com",
+        "JIRA_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+EOF
+```
+
+**Issue: Changes not taking effect**
+
+1. Ensure you saved `~/.cursor/mcp.json`
+2. Completely quit and restart Cursor (not just reload)
+3. Check Cursor's logs for MCP server initialization errors
+
+#### Security Notes for Cursor
+
+- `~/.cursor/mcp.json` contains sensitive credentials
+- **DO NOT commit this file to version control**
+- Add to `.gitignore` if using workspace-specific `.cursor/mcp.json`
+- File permissions should be user-only (600):
+  ```bash
+  chmod 600 ~/.cursor/mcp.json
+  ```
+
+#### Usage Example with Cursor
+
+Once configured, you can use natural language in Cursor:
+
+```
+You: "Show me all open bugs in PROJECT assigned to me"
+
+Cursor: [Uses jira-prod MCP server]
+Found 3 open bugs:
+- PROJECT-101: Bug description here
+- PROJECT-102: Another bug description
+- PROJECT-103: Yet another bug
+```
+
+```
+You: "Create a story in PROJECT called 'Add new feature X'"
+
+Cursor: [Uses jira-prod MCP server]
+Created story PROJECT-150: Add new feature X
+URL: https://your-instance.atlassian.net/browse/PROJECT-150
+```
 
 ---
 
