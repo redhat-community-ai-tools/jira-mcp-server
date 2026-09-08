@@ -307,7 +307,7 @@ def get_sprints_by_name(board_id: int, state: str = None) -> str:
 # ─── 5. Write Operations ───────────────────────────────────────────────────────
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def create_issue(
     project_key: str,
     summary: str,
@@ -335,7 +335,7 @@ def create_issue(
         raise HTTPException(status_code=400, detail=f"Failed to create issue: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def update_issue(
     issue_key: str,
     summary: str = None,
@@ -366,7 +366,7 @@ def update_issue(
         raise HTTPException(status_code=400, detail=f"Failed to update issue {issue_key}: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def add_comment(issue_key: str, comment_body: str) -> str:
     """Add a comment to a Jira issue."""
     try:
@@ -377,7 +377,7 @@ def add_comment(issue_key: str, comment_body: str) -> str:
         raise HTTPException(status_code=400, detail=f"Failed to add comment to {issue_key}: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def delete_comment(issue_key: str, comment_id: str) -> str:
     """Delete a comment from a Jira issue."""
     try:
@@ -411,7 +411,7 @@ def get_issue_comments(issue_key: str) -> str:
         raise HTTPException(status_code=400, detail=f"Failed to get comments for {issue_key}: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def assign_issue(issue_key: str, assignee: str) -> str:
     """Assign a Jira issue to a user."""
     try:
@@ -422,7 +422,7 @@ def assign_issue(issue_key: str, assignee: str) -> str:
         raise HTTPException(status_code=400, detail=f"Failed to assign issue {issue_key}: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def unassign_issue(issue_key: str) -> str:
     """Unassign a Jira issue."""
     try:
@@ -433,7 +433,7 @@ def unassign_issue(issue_key: str) -> str:
         raise HTTPException(status_code=400, detail=f"Failed to unassign issue {issue_key}: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def transition_issue(issue_key: str, transition_name: str, comment: str = None) -> str:
     """Transition a Jira issue to a new status."""
     try:
@@ -476,7 +476,7 @@ def get_issue_transitions(issue_key: str) -> str:
         )
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def delete_issue(issue_key: str) -> str:
     """Delete a Jira issue (use with caution)."""
     try:
@@ -487,7 +487,7 @@ def delete_issue(issue_key: str) -> str:
         raise HTTPException(status_code=400, detail=f"Failed to delete issue {issue_key}: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def add_issue_labels(issue_key: str, labels: list) -> str:
     """Add labels to a Jira issue."""
     try:
@@ -500,7 +500,7 @@ def add_issue_labels(issue_key: str, labels: list) -> str:
         raise HTTPException(status_code=400, detail=f"Failed to add labels to {issue_key}: {e}")
 
 
-@mcp.tool(enabled=ENABLE_WRITE)
+@mcp.tool() if ENABLE_WRITE else lambda f: f
 def remove_issue_labels(issue_key: str, labels: list) -> str:
     """Remove labels from a Jira issue."""
     try:
